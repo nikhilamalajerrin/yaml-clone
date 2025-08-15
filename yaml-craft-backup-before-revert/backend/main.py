@@ -7,7 +7,7 @@ Tharavu Dappa Backend — Light index + Robust pipeline executor
 import inspect
 import importlib
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Set, Iterable, Union
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -16,8 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import yaml
 from io import BytesIO
+import ast  # <-- added for indexer parsing & literal_eval
+import traceback
 
-app = FastAPI(title="Tharavu Dappa Backend", version="3.1.0")
+app = FastAPI(title="Tharavu Dappa Backend", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,6 +71,60 @@ def _add(functions: List[Dict[str, Any]], names: Set[str],
     functions.append(info)
     names.add(suggestion)
 
+def _indexer_stubs_for_class(cls, cls_name: str) -> List[Dict[str, Any]]:
+    """
+    Auto-discover indexers (iloc/loc/at/iat) by inspecting a tiny dummy instance.
+    We don't change your behavior; just make them searchable with synthetic params.
+    """
+    stubs = []
+    dummy = None
+    try:
+        if cls_name == "DataFrame":
+            dummy = pd.DataFrame({"_": [0]})
+        elif cls_name == "Series":
+            dummy = pd.Series([0])
+        elif cls_name == "Index":
+            dummy = pd.Index([0])
+    except Exception:
+        dummy = None
+
+    if dummy is None:
+        return stubs
+
+    for attr in dir(dummy):
+        if attr.startswith("_"):
+            continue
+        try:
+            val = getattr(dummy, attr)
+        except Exception:
+            continue
+        t = type(val)
+        mod = getattr(t, "__module__", "")
+        tname = getattr(t, "__name__", "")
+        if "pandas.core.indexing" in mod and "Indexer" in tname:
+            # synthetic signature for your Param UI
+            params = [{"name": "self", "kind": "POSITIONAL_OR_KEYWORD", "required": True, "default": None, "annotation": None}]
+            if "AtIndexer" in tname or attr in ("at", "iat"):
+                params += [
+                    {"name": "row", "kind": "POSITIONAL_OR_KEYWORD", "required": True, "default": None, "annotation": None},
+                    {"name": "col", "kind": "POSITIONAL_OR_KEYWORD", "required": True, "default": None, "annotation": None},
+                    {"name": "value", "kind": "POSITIONAL_OR_KEYWORD", "required": False, "default": None, "annotation": None},
+                ]
+            else:
+                params += [
+                    {"name": "rows", "kind": "POSITIONAL_OR_KEYWORD", "required": False, "default": ":", "annotation": None},
+                    {"name": "cols", "kind": "POSITIONAL_OR_KEYWORD", "required": False, "default": ":", "annotation": None},
+                ]
+            stubs.append({
+                "name": f"{cls_name}.{attr}",
+                "doc": getattr(pd.DataFrame, attr, None).__doc__ or f"{cls_name}.{attr} indexer",
+                "params": params,
+                "module": "pandas.core.indexing",
+                "library": "pandas",
+                "category": cls_name,
+            })
+    return stubs
+
 def _collect_light() -> Tuple[List[Dict[str, Any]], List[str]]:
     functions: List[Dict[str, Any]] = []
     suggestions: Set[str] = set()
@@ -98,6 +154,10 @@ def _collect_light() -> Tuple[List[Dict[str, Any]], List[str]]:
             if _callable(meth):
                 _add(functions, suggestions, meth, m, "pandas", cls_name, f"{cls_name}.{m}")
                 suggestions.add(f"{cls_name}.{m}")
+        # auto-inject indexers for search (iloc/loc/at/iat)
+        for stub in _indexer_stubs_for_class(cls, cls_name):
+            functions.append(stub)
+            suggestions.add(stub["name"])
 
     # pandas submodules (light)
     for sub in ("io", "plotting"):
@@ -157,6 +217,7 @@ def get_index() -> Tuple[List[Dict[str, Any]], List[str]]:
 
 def get_callable_from_name(func_name: str):
     """Resolve a pandas/numpy function or pandas method by canonical/name."""
+    # indexers are not callables: handled in pipeline_run (we keep your resolver unchanged)
     # module path (pandas.x.y or numpy.x.y)
     if func_name.startswith("pandas.") or func_name.startswith("numpy."):
         parts = func_name.split(".")
@@ -230,7 +291,6 @@ def _try_yaml_or_json_scalar(s: str) -> Any:
     # Try YAML parse on single-line scalars/lists/dicts
     try:
         v = yaml.safe_load(s)
-        # Avoid accidental parse of "read_csv_0" into something unexpected
         return v
     except Exception:
         return s
@@ -266,7 +326,6 @@ def extract_param_node_refs(params: Dict[str, Any]) -> Set[str]:
     refs = set()
     for v in params.values():
         if isinstance(v, str):
-            # likely node id
             refs.add(v)
         elif isinstance(v, (list, tuple)):
             for x in v:
@@ -292,6 +351,59 @@ def resolve_param_references(params: Dict[str, Any], executed: Dict[str, Any]) -
         return v
     return {k: resolve(v) for k, v in params.items()}
 
+def _normalize_axis(v: Any) -> Any:
+    # VERY light normalization; doesn't change other behavior
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "columns", "column", "cols"): return 1
+        if s in ("0", "index", "row", "rows"): return 0
+    return v
+
+# Indexer parsing (strings -> slice/list/int/label)
+def _parse_indexer(v, numeric: bool):
+    """
+    Accepts:
+      ":" -> slice(None)
+      "a:b" / "a:b:c" -> slice (ints if numeric=True else labels)
+      "0" -> int if numeric else label "0"
+      "[0,1]" / "['A','B']" -> list via literal_eval
+      plain strings -> label (or int if numeric=True)
+    """
+    if v is None:
+        return slice(None)
+    if isinstance(v, slice):
+        return v
+    if isinstance(v, (list, tuple, int)):
+        return v
+
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s == ":":
+            return slice(None)
+        # slice notations
+        if ":" in s and not (s.startswith("{") or s.startswith("[")):
+            parts = s.split(":")
+            def _to_int(x):
+                x = x.strip()
+                return None if x == "" else (int(x) if numeric else x)
+            if len(parts) == 2:
+                a, b = parts
+                return slice(_to_int(a), _to_int(b))
+            if len(parts) == 3:
+                a, b, c = parts
+                return slice(_to_int(a), _to_int(b), _to_int(c))
+        try:
+            val = ast.literal_eval(s)
+            return val
+        except Exception:
+            if numeric:
+                try:
+                    return int(s)
+                except Exception:
+                    pass
+            return s
+    return v
+
 # -------------------- pipeline executor --------------------
 
 @app.post("/pipeline/run")
@@ -315,6 +427,7 @@ async def pipeline_run(
     # file bytes (for read_* convenience)
     uploaded_bytes = await file.read() if file else None
 
+    # Execute until all done or we can't progress
     while remaining:
         made_progress = False
 
@@ -333,23 +446,18 @@ async def pipeline_run(
             if any(d not in executed for d in all_deps):
                 continue
 
-            # Resolve function
-            try:
-                func = get_callable_from_name(func_name)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=str(e))
-
             # Resolve references (turn "read_csv_0" into actual DataFrame)
             params = resolve_param_references(params, executed)
+
+            # Light axis normalization only (safe)
+            if "axis" in params:
+                params["axis"] = _normalize_axis(params["axis"])
 
             # Receiver for methods (self/df/left)
             recv = None
             if "self" in raw_params:
                 k = raw_params["self"]
-                if isinstance(k, str):
-                    recv = executed.get(k)
-                else:
-                    recv = k
+                recv = executed.get(k) if isinstance(k, str) else k
                 params.pop("self", None)
             elif "df" in raw_params:
                 k = raw_params["df"]
@@ -361,10 +469,61 @@ async def pipeline_run(
                 params.pop("left", None)
 
             # read_* auto: feed uploaded file
-            if uploaded_bytes is not None and func_name.startswith("read_"):
+            if uploaded_bytes is not None and isinstance(func_name, str) and func_name.startswith("read_"):
                 for k in ["filepath_or_buffer", "path_or_buf", "io", "file_path", "filepath"]:
                     if k in params:
                         params[k] = BytesIO(uploaded_bytes)
+
+            # ----- SPECIAL: DataFrame indexers (iloc/loc/at/iat) -----
+            if isinstance(func_name, str) and func_name.startswith("DataFrame."):
+                attr = func_name.split(".", 1)[1]
+                try:
+                    dummy = pd.DataFrame({"_":[0]})
+                    if hasattr(dummy, attr):
+                        # verify it's really an indexer
+                        idxr = getattr(dummy, attr)
+                        t = type(idxr)
+                        if "pandas.core.indexing" in getattr(t, "__module__", "") and "Indexer" in getattr(t, "__name__", ""):
+                            # need a receiver
+                            if recv is None:
+                                # also support df param if user used that name
+                                df_recv = params.pop("df", None)
+                                if isinstance(df_recv, str):
+                                    df_recv = executed.get(df_recv)
+                                recv = recv or df_recv
+                            if recv is None:
+                                raise HTTPException(status_code=400, detail=f"{func_name} requires a receiver (self/df)")
+
+                            if attr in ("loc", "iloc"):
+                                rows = _parse_indexer(params.pop("rows", ":"), numeric=(attr == "iloc"))
+                                cols = _parse_indexer(params.pop("cols", ":"), numeric=(attr == "iloc"))
+                                result = getattr(recv, attr)[rows, cols]
+                            else:  # at / iat
+                                row = _parse_indexer(params.pop("row", None), numeric=(attr == "iat"))
+                                col = _parse_indexer(params.pop("col", None), numeric=(attr == "iat"))
+                                if "value" in params:
+                                    getattr(recv, attr)[row, col] = params["value"]
+                                    result = recv
+                                else:
+                                    result = getattr(recv, attr)[row, col]
+
+                            executed[node_id] = result
+                            remaining.remove(node_id)
+                            made_progress = True
+                            if preview_node and node_id == preview_node:
+                                return serialize_result(result)
+                            continue
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                    raise HTTPException(status_code=500, detail=f"Error executing node '{node_id}' ({func_name}): {e}\n{tb}")
+
+            # Resolve function/method/np callables (unchanged)
+            try:
+                func = get_callable_from_name(func_name)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
             # Special-case top-level pd.merge(left, right, **kwargs)
             if func is pd.merge:
@@ -406,6 +565,7 @@ async def pipeline_run(
 # -------------------- result serialization --------------------
 
 def serialize_result(result: Any):
+    # EXACTLY your behavior: stringify to avoid nulls
     if isinstance(result, pd.DataFrame):
         return {"columns": list(result.columns), "rows": result.astype(str).values.tolist()}
     if isinstance(result, pd.Series):
